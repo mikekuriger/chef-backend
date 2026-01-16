@@ -74,9 +74,9 @@ if os.path.exists(cfg_path):
     app.config.from_pyfile(cfg_path)
 
 # env overrides (Flask 3)
-app.config.from_prefixed_env(prefix="recipeR")
+app.config.from_prefixed_env(prefix="CHEF")
 
-CORS(app, supports_credentials=True,origins=["https://reciper.zentha.me", "https://dreamr-us-west-01.zentha.me", "http://localhost:5173"])
+CORS(app, supports_credentials=True,origins=["https://chef.zentha.me", "https://chef-us-west-01.zentha.me", "http://localhost:5173"])
 
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
@@ -93,15 +93,15 @@ SECRET_PEPPER = "mikekuriger@gmail.com".encode("utf-8")
 def hash_string_secret(value: str) -> str:
     return hmac.new(SECRET_PEPPER, value.encode("utf-8"), hashlib.sha256).hexdigest()
 
-WEB_CLIENT_ID = "846080686597-61d3v0687vomt4g4tl7rueu7rv9qrari.apps.googleusercontent.com"
-IOS_CLIENT_ID = "846080686597-8u85pj943ilkmlt583f3tct5h9ca0c3t.apps.googleusercontent.com"
+WEB_CLIENT_ID = "846080686597-bap701fbin0efm6m7lfcg3nhtc62nd6u.apps.googleusercontent.com"
+IOS_CLIENT_ID = "846080686597-ubo1cq65c39mk4u5adc6r1vga65mqha8.apps.googleusercontent.com"
 ALLOWED_AUDS = {WEB_CLIENT_ID, IOS_CLIENT_ID}
 ALLOWED_ISS = {"https://accounts.google.com", "accounts.google.com"}
 
 APPLE_ISSUER = "https://appleid.apple.com"
 APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
 # For native Sign in with Apple, this should match the client_id used on iOS (bundle id or service id).
-APPLE_BUNDLE_ID = "me.zentha.dreamr"
+APPLE_BUNDLE_ID = "me.zentha.chef"
 APPLE_CLIENT_ID = APPLE_BUNDLE_ID
 
 _apple_jwk_client = PyJWKClient(APPLE_JWKS_URL)
@@ -918,7 +918,7 @@ def load_user(user_id):
 
 # Sends confirmation email (new)
 def send_confirmation_email(recipient_email, token):
-    base = app.config.get("CONFIRM_LINK_BASE", "https://dreamr-us-west-01.zentha.me/confirm")
+    base = app.config.get("CONFIRM_LINK_BASE", "https://chef-us-west-01.zentha.me/confirm")
     confirm_url = f"{base}?token={token}"
     msg = Message(
         subject="Confirm your AI Chef account",
@@ -1435,7 +1435,7 @@ def api_request_password_reset():
         db.session.commit()
 
         try:
-            base = app.config.get("RESET_LINK_BASE", "https://dreamr.zentha.me/reset")
+            base = app.config.get("RESET_LINK_BASE", "https://chef.zentha.me/reset")
             link = f"{base}?token={raw}"
             msg = Message(
                 subject="Reset your AI Chef password",
@@ -1593,23 +1593,74 @@ def api_change_password():
     return jsonify({"message": "Password changed"}), 200
 
 
+
 @app.route("/api/login", methods=["POST"])
 def login():
-    data = request.get_json() or {}
-    email = data.get("email", "").strip().lower()
+    data = request.get_json(silent=True) or {}
+
+    email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
+
+    if not email or not password:
+        return jsonify({"error": "invalid_request", "message": "Email and password are required."}), 400
+
     user = User.query.filter_by(email=email).first()
-    if not user or not bcrypt.checkpw(password.encode('utf-8'), user.password.encode('utf-8')):
-        return jsonify({"error": "Invalid credentials"}), 401
+
+    # Do not reveal whether the email exists (prevents account enumeration)
+    if not user:
+        return jsonify({"error": "invalid_credentials", "message": "Invalid credentials"}), 401
+
+    # Handle social-only accounts (no password set)
+    stored = (user.password or "").strip()
+    if not stored:
+        return jsonify({
+            "error": "password_not_set",
+            "message": "This account does not have a password. Sign in with Google/Apple or set a password."
+        }), 401
+
+    # Handle common bad storage: "b'$2b$...'" stored as text
+    if stored.startswith("b'") or stored.startswith('b"'):
+        try:
+            import ast
+            stored = ast.literal_eval(stored).decode("utf-8")
+        except Exception:
+            return jsonify({"error": "invalid_credentials", "message": "Invalid credentials"}), 401
+
+    # Verify bcrypt safely
+    try:
+        ok = bcrypt.checkpw(password.encode("utf-8"), stored.encode("utf-8"))
+    except ValueError:
+        ok = False
+
+    if not ok:
+        return jsonify({"error": "invalid_credentials", "message": "Invalid credentials"}), 401
+
     login_user(user, remember=True)
-    # return jsonify({"message": "Logged in"})
+
     return jsonify({
         "message": "Logged in",
-        "user": {
-            "id": user.id,
-            "email": user.email
-        }
-    })
+        "user": {"id": user.id, "email": user.email}
+    }), 200
+
+
+
+# @app.route("/api/login", methods=["POST"])
+# def login():
+#     data = request.get_json() or {}
+#     email = data.get("email", "").strip().lower()
+#     password = data.get("password") or ""
+#     user = User.query.filter_by(email=email).first()
+#     if not user or not bcrypt.checkpw(password.encode('utf-8'), user.password.encode('utf-8')):
+#         return jsonify({"error": "Invalid credentials"}), 401
+#     login_user(user, remember=True)
+#     # return jsonify({"message": "Logged in"})
+#     return jsonify({
+#         "message": "Logged in",
+#         "user": {
+#             "id": user.id,
+#             "email": user.email
+#         }
+#     })
 
 
 @app.route("/api/logout", methods=["POST"])
@@ -1851,7 +1902,8 @@ def chat():
 
     # Check plan and possibly decrement text quota
     decremented_text = False
-    is_pro = _user_is_pro(current_user.id)
+    is_pro = True
+    #is_pro = _user_is_pro(current_user.id)
 
     try:
         if not is_pro:
