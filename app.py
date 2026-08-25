@@ -2109,14 +2109,19 @@ def generate_recipe_image_bytes(prompt):
     return base64.b64decode(b64)
 
 
+# Absolute, hardcoded (env-overridable) target — deliberately NOT derived
+# from __file__ or the process's working directory. Both were tried and
+# both broke: this app.py is apparently deployed/run from inside
+# /data/dreamr-frontend (shared with dreamr, per the venv path also being
+# /opt/dreamr-venv), so anything relative to "where this script lives" or
+# "where the process started" resolves into dreamr's tree instead of
+# chef's. This is the one path that's actually unambiguous.
+CHEF_STATIC_IMAGE_DIR = os.getenv("CHEF_STATIC_IMAGE_DIR", "/data/chef-frontend/static/images/recipes")
+
+
 def save_recipe_image(img_bytes):
     filename = f"{uuid.uuid4().hex}.png"
-    # Anchor to app.py's own location instead of a relative path — a relative
-    # "static/images/..." path resolves against the process's working
-    # directory, which depends on how gunicorn was launched (and was
-    # observed writing into dreamr's directory instead of chef's).
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    image_path = os.path.join(base_dir, "static", "images", "recipes", filename)
+    image_path = os.path.join(CHEF_STATIC_IMAGE_DIR, filename)
     os.makedirs(os.path.dirname(image_path), exist_ok=True)
     with open(image_path, "wb") as f:
         f.write(img_bytes)
