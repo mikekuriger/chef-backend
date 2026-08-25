@@ -19,7 +19,10 @@ Always follow these rules:
 Format your response as follows:
     **Title:**
     **Difficulty:** (easy / medium / advanced)
-    **Description:** (short, appealing)
+    **Description:** (short, appealing — do NOT mention a specific number of
+        servings/people here or anywhere in Instructions/Variations; the app
+        shows servings as its own editable field, and a number stated in
+        prose here would go stale as soon as the user adjusts it)
     **Course:** (exactly one of: {", ".join(RECIPE_COURSES)})
     **Main Ingredient:** (one, occasionally two of: {", ".join(RECIPE_MAIN_INGREDIENTS)})
     **Time:** (estimated prep, cook, total)

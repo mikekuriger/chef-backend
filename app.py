@@ -259,7 +259,6 @@ class Recipe(db.Model):
     course = db.Column(db.String(50), nullable=True)
     main_ingredient = db.Column(db.String(100), nullable=True)
     ingredients_json = db.Column(db.Text, nullable=True)  # JSON list of {quantity, unit, name}
-    base_servings = db.Column(db.Integer, nullable=True)  # servings the structured ingredients were written for
     time = db.Column(db.String(50))
     servings = db.Column(db.String(50))
     ingredients = db.Column(db.Text, nullable=True)
@@ -292,7 +291,7 @@ class CanonicalRecipe(db.Model):
     main_ingredient = db.Column(db.String(100), nullable=True)
     tags = db.Column(db.Text, nullable=True)
     time = db.Column(db.String(50))
-    base_servings = db.Column(db.Integer, nullable=True)
+    servings = db.Column(db.String(50), nullable=True)
     ingredients_json = db.Column(db.Text, nullable=True)
     instructions = db.Column(db.Text, nullable=True)
     notes = db.Column(db.Text, nullable=True)
@@ -1768,7 +1767,7 @@ def call_openai_with_retry(prompt, retries=3, delay=2):
                 raise
 
 
-def _build_user_payload(chef_prompt: str, user_id: int, message: str) -> str:
+def _build_user_payload(chef_prompt: str, user_id: int, message: str, default_servings=None):
     try:
         u = User.query.get(user_id)   # your User model
     except Exception:
@@ -1776,6 +1775,11 @@ def _build_user_payload(chef_prompt: str, user_id: int, message: str) -> str:
         intro = None
 
     parts = [chef_prompt]
+    if default_servings:
+        parts.append(
+            f"Unless the request below explicitly states a different number of "
+            f"servings or people, make this recipe for {default_servings} servings."
+        )
     parts.append("Request:\n" + message.strip())
     return "\n\n".join(parts)
 
@@ -1835,13 +1839,6 @@ def parse_ingredients_block(block):
         if parsed:
             items.append(parsed)
     return items
-
-
-def extract_base_servings(servings_text):
-    if not servings_text:
-        return None
-    m = re.search(r"\d+", servings_text)
-    return int(m.group()) if m else None
 
 
 def parse_recipe_ai_response(content: str) -> dict:
@@ -2012,7 +2009,6 @@ def parse_recipe_ai_response(content: str) -> dict:
         "tags":                 tags_str,
         "time":                 time_text or None,
         "servings":             servings_text or None,
-        "base_servings":        extract_base_servings(servings_text),
         "ingredients":          ingredients_block or None,
         "ingredients_structured": parse_ingredients_block(ingredients_block),
         "instructions":         instructions_block or None,
@@ -2115,7 +2111,12 @@ def generate_recipe_image_bytes(prompt):
 
 def save_recipe_image(img_bytes):
     filename = f"{uuid.uuid4().hex}.png"
-    image_path = os.path.join("static", "images", "recipes", filename)
+    # Anchor to app.py's own location instead of a relative path — a relative
+    # "static/images/..." path resolves against the process's working
+    # directory, which depends on how gunicorn was launched (and was
+    # observed writing into dreamr's directory instead of chef's).
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    image_path = os.path.join(base_dir, "static", "images", "recipes", filename)
     os.makedirs(os.path.dirname(image_path), exist_ok=True)
     with open(image_path, "wb") as f:
         f.write(img_bytes)
@@ -2137,7 +2138,7 @@ def _cache_canonical_recipe(message, parsed, content):
             main_ingredient=parsed.get("main_ingredient"),
             tags=parsed.get("tags"),
             time=parsed.get("time"),
-            base_servings=parsed.get("base_servings"),
+            servings=parsed.get("servings"),
             ingredients_json=json.dumps(parsed.get("ingredients_structured") or []),
             instructions=parsed.get("instructions"),
             variations=parsed.get("variations"),
@@ -2179,6 +2180,13 @@ def chat():
     if not message:
         logger.debug("[WARN] Missing request message.")
         return jsonify({"error": "Missing request message."}), 400
+
+    try:
+        default_servings = int(data.get("default_servings")) if data.get("default_servings") else None
+        if default_servings is not None and not (1 <= default_servings <= 50):
+            default_servings = None
+    except (TypeError, ValueError):
+        default_servings = None
 
     # Check plan and possibly decrement text quota
     decremented_text = False
@@ -2231,8 +2239,7 @@ def chat():
                 recipe.categories        = ", ".join(v for v in [match.course, match.main_ingredient] if v) or None
                 recipe.tags              = match.tags
                 recipe.time              = match.time
-                recipe.servings          = str(match.base_servings) if match.base_servings else None
-                recipe.base_servings     = match.base_servings
+                recipe.servings          = match.servings
                 recipe.ingredients_json  = match.ingredients_json
                 recipe.ingredients       = "\n".join(
                     f"- {' '.join(p for p in [i.get('quantity'), i.get('unit'), i.get('name')] if p)}"
@@ -2257,7 +2264,6 @@ def chat():
                     "tags":         recipe.tags,
                     "time":         recipe.time,
                     "servings":     recipe.servings,
-                    "base_servings": recipe.base_servings,
                     "ingredients":  recipe.ingredients,
                     "ingredients_json": recipe.ingredients_json,
                     "instructions": recipe.instructions,
@@ -2274,7 +2280,7 @@ def chat():
             logger.error("CATEGORY_PROMPTS['chef'] is missing")
             raise RuntimeError("Chef prompt not configured")
 
-        prompt = _build_user_payload(chef_prompt, current_user.id, message)
+        prompt = _build_user_payload(chef_prompt, current_user.id, message, default_servings=default_servings)
         logger.info(f"Sending prompt to OpenAI (pro={is_pro})")
         logger.debug(f"Chef prompt: {prompt}")
 
@@ -2304,7 +2310,6 @@ def chat():
         recipe.tags         = parsed.get("tags")
         recipe.time         = parsed.get("time")
         recipe.servings     = parsed.get("servings")
-        recipe.base_servings = parsed.get("base_servings")
         recipe.ingredients  = parsed.get("ingredients")
         recipe.ingredients_json = json.dumps(parsed.get("ingredients_structured") or [])
         recipe.instructions = parsed.get("instructions")
@@ -2333,7 +2338,6 @@ def chat():
                 "tags":         recipe.tags,
                 "time":         recipe.time,
                 "servings":     recipe.servings,
-                "base_servings": recipe.base_servings,
                 "ingredients":  recipe.ingredients,
                 "ingredients_json": recipe.ingredients_json,
                 "instructions": recipe.instructions,
@@ -2385,7 +2389,6 @@ def get_allrecipes():
             "tags": r.tags,
             "time": r.time,
             "servings": r.servings,
-            "base_servings": r.base_servings,
             "ingredients": r.ingredients,
             "ingredients_json": r.ingredients_json,
             "instructions": r.instructions,
@@ -2438,7 +2441,6 @@ def get_recipes():
             "tags": r.tags,
             "time": r.time,
             "servings": r.servings,
-            "base_servings": r.base_servings,
             "text": r.text,               # original user prompt
             "ai_response": r.ai_response, # full AI reply
             "notes": r.notes,
@@ -2515,12 +2517,6 @@ def update_recipe(recipe_id):
         recipe.time = (data.get("time") or "").strip() or None
     if "servings" in data:
         recipe.servings = (data.get("servings") or "").strip() or None
-    if "base_servings" in data:
-        raw_bs = data.get("base_servings")
-        try:
-            recipe.base_servings = int(raw_bs) if raw_bs not in (None, "") else None
-        except (TypeError, ValueError):
-            return jsonify({"error": "base_servings must be an integer"}), 400
     if "instructions" in data:
         recipe.instructions = (data.get("instructions") or "").strip() or None
     if "notes" in data:
@@ -2570,7 +2566,6 @@ def update_recipe(recipe_id):
         "tags":             recipe.tags,
         "time":             recipe.time,
         "servings":         recipe.servings,
-        "base_servings":    recipe.base_servings,
         "ingredients":      recipe.ingredients,
         "ingredients_json": recipe.ingredients_json,
         "instructions":     recipe.instructions,
