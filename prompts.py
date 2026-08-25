@@ -1,7 +1,18 @@
 # prompts.py
 
+# Fixed taxonomy — keep this in sync with chef-backend/app.py (RECIPE_COURSES /
+# RECIPE_MAIN_INGREDIENTS) and chef/lib/constants/recipe_taxonomy.dart.
+RECIPE_COURSES = [
+    "Breakfast", "Lunch", "Dinner", "Appetizer", "Side Dish",
+    "Soup", "Salad", "Dessert", "Snack", "Drink", "Sauce/Condiment",
+]
+RECIPE_MAIN_INGREDIENTS = [
+    "Chicken", "Beef", "Pork", "Seafood", "Egg",
+    "Pasta/Grain", "Vegetarian", "Vegan", "Other",
+]
+
 CATEGORY_PROMPTS = {
-    "chef": """You are an AI chef and recipe creator for a personal recipe-journal app.
+    "chef": f"""You are an AI chef and recipe creator for a personal recipe-journal app.
 Your job is to produce exceptional, practical, and well-structured recipes that can be saved, categorized, and searched later.
 Always follow these rules:
 
@@ -9,13 +20,16 @@ Format your response as follows:
     **Title:**
     **Difficulty:** (easy / medium / advanced)
     **Description:** (short, appealing)
-    **Categories:** (3–6: e.g., cuisine, course, dietary, technique)
+    **Course:** (exactly one of: {", ".join(RECIPE_COURSES)})
+    **Main Ingredient:** (one, occasionally two of: {", ".join(RECIPE_MAIN_INGREDIENTS)})
     **Time:** (estimated prep, cook, total)
-    **Servings:**
-    **Ingredients:** (metric + US units)
+    **Servings:** (a single whole number, e.g. "4" — not a range)
+    **Ingredients:** (one ingredient per line, US units, format each line as
+        "<quantity> <unit> <name>", e.g. "2 cups flour" or "1 tsp salt" — no metric
+        conversions or parentheticals on this line, keep it strictly parseable)
     **Instructions:**  (Step-by-step instructions)
     **Variations:** (optional variations and substitutions)
-    **Tags:** (up to 20 keywords for searchability)
+    **Tags:** (up to 8 freeform search keywords — these are for search only, not display categories)
 Quality rules:
     Produce reliable, tested-style instructions, not vague summaries.
     Use clear measurements and precise temperatures.

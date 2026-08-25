@@ -18,7 +18,7 @@ from openai import OpenAI
 from PIL import Image
 from PIL import ImageFilter
 #from prompts import CATEGORY_PROMPTS, TONE_TO_STYLE
-from prompts import CATEGORY_PROMPTS
+from prompts import CATEGORY_PROMPTS, RECIPE_COURSES, RECIPE_MAIN_INGREDIENTS
 from quota import ensure_week_current, next_reset_iso, get_or_create_credits
 from quota import decrement_text_or_deny, refund_text
 from quota import decrement_image_or_deny, refund_image
@@ -36,6 +36,7 @@ import hashlib, secrets, hmac
 import io
 import json
 import logging
+import math
 import openai
 import os
 import re
@@ -255,6 +256,10 @@ class Recipe(db.Model):
     description = db.Column(db.Text, nullable=True)
     categories = db.Column(db.Text, nullable=True)
     tags = db.Column(db.Text, nullable=True)
+    course = db.Column(db.String(50), nullable=True)
+    main_ingredient = db.Column(db.String(100), nullable=True)
+    ingredients_json = db.Column(db.Text, nullable=True)  # JSON list of {quantity, unit, name}
+    base_servings = db.Column(db.Integer, nullable=True)  # servings the structured ingredients were written for
     time = db.Column(db.String(50))
     servings = db.Column(db.String(50))
     ingredients = db.Column(db.Text, nullable=True)
@@ -264,6 +269,40 @@ class Recipe(db.Model):
     difficulty = db.Column(db.String(50))
     archived = db.Column(db.Boolean, default=False)
     image_file = db.Column(db.String(255))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    # Attribution only — which shared canonical recipe this personal copy came
+    # from, if any. Never used for diff/merge; editing this row never touches
+    # the canonical row it points at.
+    source_canonical_id = db.Column(db.Integer, db.ForeignKey('canonical_recipe.id'), nullable=True)
+
+
+class CanonicalRecipe(db.Model):
+    """
+    A shared, de-duplicated recipe cache. Generic requests ("chicken parmesan")
+    are matched here by embedding similarity before falling back to a fresh
+    OpenAI call; a miss generates normally and gets inserted here too, so the
+    next similar request is a hit. See find_canonical_match() / _is_generic_request().
+    """
+    __tablename__ = "canonical_recipe"
+
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.Text, nullable=True)
+    description = db.Column(db.Text, nullable=True)
+    course = db.Column(db.String(50), nullable=True)
+    main_ingredient = db.Column(db.String(100), nullable=True)
+    tags = db.Column(db.Text, nullable=True)
+    time = db.Column(db.String(50))
+    base_servings = db.Column(db.Integer, nullable=True)
+    ingredients_json = db.Column(db.Text, nullable=True)
+    instructions = db.Column(db.Text, nullable=True)
+    notes = db.Column(db.Text, nullable=True)
+    variations = db.Column(db.Text, nullable=True)
+    difficulty = db.Column(db.String(50))
+    ai_response = db.Column(db.Text, nullable=True)
+    image_file = db.Column(db.String(255), nullable=True)
+    image_prompt = db.Column(db.Text, nullable=True)
+    embedding = db.Column(db.Text, nullable=True)  # JSON-encoded list[float]
+    hit_count = db.Column(db.Integer, nullable=False, default=0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
@@ -1741,6 +1780,70 @@ def _build_user_payload(chef_prompt: str, user_id: int, message: str) -> str:
     return "\n\n".join(parts)
 
 
+_INGREDIENT_UNITS = {
+    "cup", "cups", "tbsp", "tablespoon", "tablespoons", "tsp", "teaspoon", "teaspoons",
+    "oz", "ounce", "ounces", "lb", "lbs", "pound", "pounds",
+    "g", "gram", "grams", "kg", "kilogram", "kilograms",
+    "ml", "milliliter", "milliliters", "l", "liter", "liters",
+    "pint", "pints", "quart", "quarts", "gallon", "gallons",
+    "clove", "cloves", "pinch", "pinches", "dash", "can", "cans",
+    "slice", "slices", "stick", "sticks", "bunch", "bunches",
+    "head", "heads", "piece", "pieces", "sprig", "sprigs",
+}
+
+_INGREDIENT_QTY_RE = re.compile(r"^\s*(?P<qty>\d+\s+\d+/\d+|\d+/\d+|\d+\.\d+|\d+)\s*")
+
+
+def parse_ingredient_line(line):
+    """
+    Split one ingredient line ("2 cups flour", "1 tsp salt", "salt to taste")
+    into {"quantity", "unit", "name"}. Falls back to quantity/unit=None and
+    the full line as name whenever it can't confidently parse — never raises,
+    that row just isn't scalable and stays editable as plain text.
+    """
+    text = line.strip().lstrip("-*•").strip()
+    text = re.sub(r"^\d+[.)]\s*", "", text)  # strip leading "1." / "1)" list markers
+    if not text:
+        return None
+
+    quantity = None
+    unit = None
+    name = text
+
+    m = _INGREDIENT_QTY_RE.match(text)
+    if m:
+        quantity = m.group("qty")
+        rest = text[m.end():].strip()
+        if rest:
+            first_word, _, remainder = rest.partition(" ")
+            bare = first_word.strip(".,").lower()
+            if bare in _INGREDIENT_UNITS:
+                unit = first_word.strip(".,")
+                name = remainder.strip() or first_word
+            else:
+                name = rest
+
+    return {"quantity": quantity, "unit": unit, "name": name}
+
+
+def parse_ingredients_block(block):
+    if not block:
+        return []
+    items = []
+    for line in block.splitlines():
+        parsed = parse_ingredient_line(line)
+        if parsed:
+            items.append(parsed)
+    return items
+
+
+def extract_base_servings(servings_text):
+    if not servings_text:
+        return None
+    m = re.search(r"\d+", servings_text)
+    return int(m.group()) if m else None
+
+
 def parse_recipe_ai_response(content: str) -> dict:
     """
     Parse the AI response text into fields matching the Recipe model.
@@ -1769,6 +1872,8 @@ def parse_recipe_ai_response(content: str) -> dict:
     TITLE_MARK        = "**Title:**"        if "**Title:**"        in content else ("Title:"        if "Title:"        in content else None)
     DESCRIPTION_MARK  = "**Description:**"  if "**Description:**"  in content else ("Description:"  if "Description:"  in content else None)
     CATEGORIES_MARK   = "**Categories:**"   if "**Categories:**"   in content else ("Categories:"   if "Categories:"   in content else None)
+    COURSE_MARK       = "**Course:**"       if "**Course:**"       in content else ("Course:"       if "Course:"       in content else None)
+    MAINING_MARK      = "**Main Ingredient:**" if "**Main Ingredient:**" in content else ("Main Ingredient:" if "Main Ingredient:" in content else None)
     TAGS_MARK         = "**Tags:**"         if "**Tags:**"         in content else ("Tags:"         if "Tags:"         in content else None)
     TIME_MARK         = "**Time:**"         if "**Time:**"         in content else ("Time:"         if "Time:"         in content else None)
     SERVINGS_MARK     = "**Servings:**"     if "**Servings:**"     in content else ("Servings:"     if "Servings:"     in content else None)
@@ -1785,6 +1890,8 @@ def parse_recipe_ai_response(content: str) -> dict:
     iTitle  = _idx(TITLE_MARK)
     iDesc   = _idx(DESCRIPTION_MARK)
     iCats   = _idx(CATEGORIES_MARK)
+    iCourse = _idx(COURSE_MARK)
+    iMainI  = _idx(MAINING_MARK)
     iTags   = _idx(TAGS_MARK)
     iTime   = _idx(TIME_MARK)
     iServ   = _idx(SERVINGS_MARK)
@@ -1796,7 +1903,7 @@ def parse_recipe_ai_response(content: str) -> dict:
 
     all_indices = [
         i for i in [
-            iTitle, iDesc, iCats, iTags, iTime, iServ,
+            iTitle, iDesc, iCats, iCourse, iMainI, iTags, iTime, iServ,
             iIngr, iInstr, iVars, iDiff
             # iIngr, iInstr, iNotes, iVars, iDiff
         ] if i != -1
@@ -1831,6 +1938,35 @@ def parse_recipe_ai_response(content: str) -> dict:
     else:
         categories_list = []
     categories_str = ", ".join(categories_list) if categories_list else None
+
+    # Course / Main Ingredient — map free AI text onto the fixed taxonomy.
+    # Case-insensitive exact match only; anything that doesn't match a known
+    # value is dropped (left None) rather than polluting the taxonomy with
+    # AI-invented strings.
+    def _match_taxonomy(raw_block, choices, max_matches):
+        if not raw_block:
+            return None
+        candidates = [
+            c.strip()
+            for line in raw_block.splitlines()
+            for c in line.split(",")
+            if c.strip()
+        ]
+        lookup = {choice.lower(): choice for choice in choices}
+        matched = []
+        for cand in candidates:
+            hit = lookup.get(cand.strip().lower())
+            if hit and hit not in matched:
+                matched.append(hit)
+            if len(matched) >= max_matches:
+                break
+        return ", ".join(matched) if matched else None
+
+    course_block = slice_between(COURSE_MARK, iCourse, _next_idx(iCourse))
+    course_str = _match_taxonomy(course_block, RECIPE_COURSES, max_matches=1)
+
+    main_ingredient_block = slice_between(MAINING_MARK, iMainI, _next_idx(iMainI))
+    main_ingredient_str = _match_taxonomy(main_ingredient_block, RECIPE_MAIN_INGREDIENTS, max_matches=2)
 
     # Tags
     tags_block = slice_between(TAGS_MARK, iTags, _next_idx(iTags))
@@ -1868,18 +2004,162 @@ def parse_recipe_ai_response(content: str) -> dict:
         instructions_block = content.strip()
 
     return {
-        "title":        title or None,
-        "description":  description or None,
-        "categories":   categories_str,
-        "tags":         tags_str,
-        "time":         time_text or None,
-        "servings":     servings_text or None,
-        "ingredients":  ingredients_block or None,
-        "instructions": instructions_block or None,
+        "title":                title or None,
+        "description":          description or None,
+        "categories":           categories_str,
+        "course":               course_str,
+        "main_ingredient":      main_ingredient_str,
+        "tags":                 tags_str,
+        "time":                 time_text or None,
+        "servings":             servings_text or None,
+        "base_servings":        extract_base_servings(servings_text),
+        "ingredients":          ingredients_block or None,
+        "ingredients_structured": parse_ingredients_block(ingredients_block),
+        "instructions":         instructions_block or None,
         # "notes":        notes or None,
-        "variations":   variations or None,
-        "difficulty":   difficulty or None,
+        "variations":           variations or None,
+        "difficulty":           difficulty or None,
     }
+
+
+# --- Canonical recipe cache -------------------------------------------------
+# Generic requests ("chicken parmesan") get matched against a shared,
+# de-duplicated recipe cache by embedding similarity before falling back to a
+# fresh OpenAI call. A miss generates normally (unchanged flow) and also gets
+# inserted into the cache, so the next similar request is a hit.
+
+_GENERIC_DENYLIST = [
+    "keto", "gluten free", "gluten-free", "dairy free", "dairy-free", "vegan",
+    "vegetarian", "paleo", "low carb", "low-carb", "sugar free", "sugar-free",
+    "nut free", "nut-free", "allerg", "substitute", "instead of", "leftover",
+    "i have", "using my", "on hand", "no oven", "air fryer", "instant pot",
+    "slow cooker", "crock pot", "servings", "people", "spicy", "quick",
+    "under ", "minutes", "healthier", "cheaper", "budget", "make this",
+]
+
+
+def _is_generic_request(message):
+    """
+    Only bare dish/category asks ("chicken parmesan", "banana bread") are
+    eligible for the canonical-recipe cache. Anything with dietary, quantity,
+    time-constraint, or substitution language skips it. When uncertain, this
+    returns False — a false negative just means a normal fresh generation;
+    a false positive would mean serving someone the wrong recipe, which is
+    the failure mode to avoid.
+    """
+    text = (message or "").strip().lower()
+    if not text or len(text.split()) > 8:
+        return False
+    if re.search(r"\d", text):
+        return False
+    if any(word in text for word in _GENERIC_DENYLIST):
+        return False
+    return True
+
+
+def embed_text(text):
+    resp = client.embeddings.create(model="text-embedding-3-small", input=text)
+    return resp.data[0].embedding
+
+
+def cosine_similarity(a, b):
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+CANONICAL_MATCH_THRESHOLD = 0.88  # tune empirically once there's real traffic
+
+
+def find_canonical_match(embedding):
+    best, best_score = None, 0.0
+    for cand in CanonicalRecipe.query.all():
+        if not cand.embedding:
+            continue
+        try:
+            cand_vec = json.loads(cand.embedding)
+        except (TypeError, ValueError):
+            continue
+        score = cosine_similarity(embedding, cand_vec)
+        if score > best_score:
+            best, best_score = cand, score
+    return best if (best is not None and best_score >= CANONICAL_MATCH_THRESHOLD) else None
+
+
+def build_recipe_image_prompt(title, description, course, main_ingredient):
+    context = ". ".join(p for p in [title, description] if p) or "a home-cooked dish"
+    tags = ", ".join(p for p in [course, main_ingredient] if p)
+    return (
+        f"A professional, appetizing food-photography style image of: {context}. "
+        + (f"Category: {tags}. " if tags else "")
+        + "Overhead or 3/4 angle shot, natural lighting, on a simple plate or in a "
+          "pan, no text or watermarks."
+    )
+
+
+def generate_recipe_image_bytes(prompt):
+    image_response = client.images.generate(
+        model="gpt-image-1.5",
+        prompt=prompt,
+        n=1,
+        size="1024x1024",
+    )
+    b64 = image_response.data[0].b64_json
+    return base64.b64decode(b64)
+
+
+def save_recipe_image(img_bytes):
+    filename = f"{uuid.uuid4().hex}.png"
+    image_path = os.path.join("static", "images", "recipes", filename)
+    os.makedirs(os.path.dirname(image_path), exist_ok=True)
+    with open(image_path, "wb") as f:
+        f.write(img_bytes)
+    return filename
+
+
+def _cache_canonical_recipe(message, parsed, content):
+    """
+    Best-effort: embed + insert a freshly generated recipe into the canonical
+    cache, including generating its image right away. Never raises — a cache
+    write failure shouldn't break the user's actual recipe response.
+    """
+    try:
+        embedding = embed_text(message)
+        canonical = CanonicalRecipe(
+            title=parsed.get("title"),
+            description=parsed.get("description"),
+            course=parsed.get("course"),
+            main_ingredient=parsed.get("main_ingredient"),
+            tags=parsed.get("tags"),
+            time=parsed.get("time"),
+            base_servings=parsed.get("base_servings"),
+            ingredients_json=json.dumps(parsed.get("ingredients_structured") or []),
+            instructions=parsed.get("instructions"),
+            variations=parsed.get("variations"),
+            difficulty=parsed.get("difficulty"),
+            ai_response=content,
+            embedding=json.dumps(embedding),
+            hit_count=0,
+        )
+        db.session.add(canonical)
+        db.session.flush()
+
+        prompt = build_recipe_image_prompt(
+            canonical.title, canonical.description, canonical.course, canonical.main_ingredient
+        )
+        img_bytes = generate_recipe_image_bytes(prompt)
+        canonical.image_file = save_recipe_image(img_bytes)
+        canonical.image_prompt = prompt
+
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        logger.exception("Failed to cache canonical recipe (non-fatal)")
 
 
 # generate recipe
@@ -1929,6 +2209,63 @@ def chat():
         db.session.flush()  # get recipe.id without full commit yet
         logger.debug(f"Recipe shell saved with ID: {recipe.id}")
 
+        # 1b) Canonical-recipe cache: for a bare/generic dish request, try to
+        # match an existing shared recipe by embedding similarity before
+        # paying for a fresh OpenAI generation. See find_canonical_match().
+        is_generic = _is_generic_request(message)
+        if is_generic:
+            try:
+                request_embedding = embed_text(message)
+                match = find_canonical_match(request_embedding)
+            except Exception:
+                logger.exception("Canonical match lookup failed (non-fatal, generating fresh)")
+                match = None
+
+            if match is not None:
+                logger.info(f"Canonical cache hit: recipe {recipe.id} <- canonical {match.id}")
+                recipe.ai_response       = match.ai_response
+                recipe.title             = match.title
+                recipe.description       = match.description
+                recipe.course            = match.course
+                recipe.main_ingredient   = match.main_ingredient
+                recipe.categories        = ", ".join(v for v in [match.course, match.main_ingredient] if v) or None
+                recipe.tags              = match.tags
+                recipe.time              = match.time
+                recipe.servings          = str(match.base_servings) if match.base_servings else None
+                recipe.base_servings     = match.base_servings
+                recipe.ingredients_json  = match.ingredients_json
+                recipe.ingredients       = "\n".join(
+                    f"- {' '.join(p for p in [i.get('quantity'), i.get('unit'), i.get('name')] if p)}"
+                    for i in json.loads(match.ingredients_json or "[]")
+                ) or None
+                recipe.instructions      = match.instructions
+                recipe.variations        = match.variations
+                recipe.difficulty        = match.difficulty
+                recipe.source_canonical_id = match.id
+
+                match.hit_count = (match.hit_count or 0) + 1
+                db.session.commit()
+                logger.info(f"Recipe {recipe.id} served from canonical cache")
+
+                return jsonify({
+                    "recipe_id":    recipe.id,
+                    "title":        recipe.title,
+                    "description":  recipe.description,
+                    "categories":   recipe.categories,
+                    "course":       recipe.course,
+                    "main_ingredient": recipe.main_ingredient,
+                    "tags":         recipe.tags,
+                    "time":         recipe.time,
+                    "servings":     recipe.servings,
+                    "base_servings": recipe.base_servings,
+                    "ingredients":  recipe.ingredients,
+                    "ingredients_json": recipe.ingredients_json,
+                    "instructions": recipe.instructions,
+                    "notes":        recipe.notes,
+                    "variations":   recipe.variations,
+                    "difficulty":   recipe.difficulty,
+                }), 200
+
         # 2) Build prompt
         # For now, use the same chef prompt for both free and pro.
         # If you add a 'chef_free' key to CATEGORY_PROMPTS, switch to that here.
@@ -1954,14 +2291,22 @@ def chat():
         parsed = parse_recipe_ai_response(content)
 
         # 5) Update Recipe with parsed fields and raw AI response
-        recipe.ai_response = content
+        recipe.ai_response  = content
         recipe.title        = parsed.get("title")
         recipe.description  = parsed.get("description")
-        recipe.categories   = parsed.get("categories")
+        recipe.course           = parsed.get("course")
+        recipe.main_ingredient  = parsed.get("main_ingredient")
+        # Legacy free-text categories column, kept as a display fallback for
+        # code paths that haven't been migrated to course/main_ingredient yet.
+        recipe.categories   = ", ".join(
+            v for v in [recipe.course, recipe.main_ingredient] if v
+        ) or None
         recipe.tags         = parsed.get("tags")
         recipe.time         = parsed.get("time")
         recipe.servings     = parsed.get("servings")
+        recipe.base_servings = parsed.get("base_servings")
         recipe.ingredients  = parsed.get("ingredients")
+        recipe.ingredients_json = json.dumps(parsed.get("ingredients_structured") or [])
         recipe.instructions = parsed.get("instructions")
         recipe.notes        = parsed.get("notes")
         recipe.variations   = parsed.get("variations")
@@ -1970,6 +2315,12 @@ def chat():
         db.session.commit()
         logger.info(f"Recipe {recipe.id} committed successfully")
 
+        # 5b) This was a generic request with no canonical match — cache the
+        # freshly generated recipe (+ its image) so the next similar request
+        # is a hit. Best-effort: never fails the user's actual response.
+        if is_generic:
+            _cache_canonical_recipe(message, parsed, content)
+
         # 6) Return parsed recipe to frontend
         return jsonify(
             {
@@ -1977,10 +2328,14 @@ def chat():
                 "title":        recipe.title,
                 "description":  recipe.description,
                 "categories":   recipe.categories,
+                "course":       recipe.course,
+                "main_ingredient": recipe.main_ingredient,
                 "tags":         recipe.tags,
                 "time":         recipe.time,
                 "servings":     recipe.servings,
+                "base_servings": recipe.base_servings,
                 "ingredients":  recipe.ingredients,
+                "ingredients_json": recipe.ingredients_json,
                 "instructions": recipe.instructions,
                 "notes":        recipe.notes,
                 "variations":   recipe.variations,
@@ -2025,10 +2380,14 @@ def get_allrecipes():
             "title": r.title,
             "description": r.description,
             "categories": r.categories,
+            "course": r.course,
+            "main_ingredient": r.main_ingredient,
             "tags": r.tags,
             "time": r.time,
             "servings": r.servings,
+            "base_servings": r.base_servings,
             "ingredients": r.ingredients,
+            "ingredients_json": r.ingredients_json,
             "instructions": r.instructions,
             "notes": r.notes,
             "variations": r.variations,
@@ -2070,12 +2429,16 @@ def get_recipes():
             "description": r.description,
             "difficulty": r.difficulty,
             "categories": r.categories,
+            "course": r.course,
+            "main_ingredient": r.main_ingredient,
             "ingredients": r.ingredients,
+            "ingredients_json": r.ingredients_json,
             "instructions": r.instructions,
             "variations": r.variations,
             "tags": r.tags,
             "time": r.time,
             "servings": r.servings,
+            "base_servings": r.base_servings,
             "text": r.text,               # original user prompt
             "ai_response": r.ai_response, # full AI reply
             "notes": r.notes,
@@ -2116,6 +2479,108 @@ def delete_recipe(recipe_id):
     return "", 204
 
 
+# For editing recipes (title, course/main ingredient, ingredients, instructions, etc.)
+@app.route("/api/recipes/<int:recipe_id>", methods=["PATCH"])
+@login_required
+def update_recipe(recipe_id):
+    recipe = Recipe.query.get_or_404(recipe_id)
+    if recipe.user_id != current_user.id:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.get_json() or {}
+
+    if "title" in data:
+        recipe.title = (data.get("title") or "").strip() or None
+    if "description" in data:
+        recipe.description = (data.get("description") or "").strip() or None
+
+    if "course" in data:
+        course = (data.get("course") or "").strip()
+        if course and course not in RECIPE_COURSES:
+            return jsonify({"error": f"Invalid course: {course}"}), 400
+        recipe.course = course or None
+
+    if "main_ingredient" in data:
+        raw = data.get("main_ingredient")
+        values = raw if isinstance(raw, list) else str(raw or "").split(",")
+        values = [v.strip() for v in values if v and v.strip()]
+        for v in values:
+            if v not in RECIPE_MAIN_INGREDIENTS:
+                return jsonify({"error": f"Invalid main_ingredient: {v}"}), 400
+        recipe.main_ingredient = ", ".join(values) or None
+
+    if "tags" in data:
+        recipe.tags = (data.get("tags") or "").strip() or None
+    if "time" in data:
+        recipe.time = (data.get("time") or "").strip() or None
+    if "servings" in data:
+        recipe.servings = (data.get("servings") or "").strip() or None
+    if "base_servings" in data:
+        raw_bs = data.get("base_servings")
+        try:
+            recipe.base_servings = int(raw_bs) if raw_bs not in (None, "") else None
+        except (TypeError, ValueError):
+            return jsonify({"error": "base_servings must be an integer"}), 400
+    if "instructions" in data:
+        recipe.instructions = (data.get("instructions") or "").strip() or None
+    if "notes" in data:
+        recipe.notes = (data.get("notes") or "").strip() or None
+    if "variations" in data:
+        recipe.variations = (data.get("variations") or "").strip() or None
+    if "difficulty" in data:
+        recipe.difficulty = (data.get("difficulty") or "").strip() or None
+
+    if "ingredients" in data:
+        raw_items = data.get("ingredients") or []
+        if not isinstance(raw_items, list):
+            return jsonify({"error": "ingredients must be a list"}), 400
+        clean_items = []
+        text_lines = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                return jsonify({"error": "each ingredient must be an object"}), 400
+            name = (item.get("name") or "").strip()
+            if not name:
+                continue
+            quantity = (item.get("quantity") or "").strip() or None
+            unit = (item.get("unit") or "").strip() or None
+            clean_items.append({"quantity": quantity, "unit": unit, "name": name})
+            text_lines.append(" ".join(p for p in [quantity, unit, name] if p))
+        recipe.ingredients_json = json.dumps(clean_items)
+        # Regenerate the legacy free-text column too, so anything still
+        # reading recipe.ingredients (sharing, PDF export, etc.) stays correct.
+        recipe.ingredients = "\n".join(f"- {line}" for line in text_lines) or None
+
+    # Keep the legacy free-text categories column roughly in sync for any
+    # display path that hasn't been migrated to course/main_ingredient yet.
+    if "course" in data or "main_ingredient" in data:
+        recipe.categories = ", ".join(
+            v for v in [recipe.course, recipe.main_ingredient] if v
+        ) or None
+
+    db.session.commit()
+
+    return jsonify({
+        "id":               recipe.id,
+        "title":            recipe.title,
+        "description":      recipe.description,
+        "categories":       recipe.categories,
+        "course":           recipe.course,
+        "main_ingredient":  recipe.main_ingredient,
+        "tags":             recipe.tags,
+        "time":             recipe.time,
+        "servings":         recipe.servings,
+        "base_servings":    recipe.base_servings,
+        "ingredients":      recipe.ingredients,
+        "ingredients_json": recipe.ingredients_json,
+        "instructions":     recipe.instructions,
+        "notes":            recipe.notes,
+        "variations":       recipe.variations,
+        "difficulty":       recipe.difficulty,
+        "image_file": f"/static/images/recipes/{recipe.image_file}" if recipe.image_file else None,
+    })
+
+
 @app.route("/api/recipes/<int:recipe_id>/toggle-archived", methods=["POST"])
 @login_required
 def toggle_archived_recipe(recipe_id):
@@ -2129,6 +2594,56 @@ def toggle_archived_recipe(recipe_id):
 
     return jsonify({"archived": recipe.archived})
 
+
+# Generate (or regenerate) an AI image for one of the user's own recipes.
+# Ported from dreamr's /api/image_generate (dreamr/back_end/dreamr/app.py) —
+# chef's Flutter client (ApiService.generateRecipeImage) already calls this
+# route and expects {"image": "<path>"}; this was previously missing entirely.
+@app.route("/api/image_generate", methods=["POST"])
+@login_required
+def image_generate():
+    # Quota enforcement is disabled app-wide for now (see is_pro=True in
+    # chat()) — mirrored here for consistency rather than being the one
+    # endpoint that actually enforces it.
+    is_pro = True
+    # is_pro = _user_is_pro(current_user.id)
+
+    data = request.get_json() or {}
+    recipe_id = data.get("recipe_id")
+    if not recipe_id:
+        return jsonify({"error": "Missing recipe_id."}), 400
+
+    recipe = Recipe.query.get(recipe_id)
+    if recipe is None or recipe.user_id != current_user.id:
+        return jsonify({"error": "Recipe not found or unauthorized"}), 404
+
+    decremented_image = False
+    try:
+        if not is_pro:
+            ok = decrement_image_or_deny(current_user.id)
+            if not ok:
+                return jsonify({"error": "quota_exhausted", "kind": "image"}), 402
+            decremented_image = True
+
+        prompt = build_recipe_image_prompt(recipe.title, recipe.description, recipe.course, recipe.main_ingredient)
+        img_bytes = generate_recipe_image_bytes(prompt)
+        recipe.image_file = save_recipe_image(img_bytes)
+        db.session.commit()
+
+        return jsonify({"image": f"/static/images/recipes/{recipe.image_file}"})
+
+    except openai.OpenAIError:
+        db.session.rollback()
+        if decremented_image:
+            refund_image(current_user.id)
+        logger.error("OpenAI image generation failed", exc_info=True)
+        return jsonify({"error": "OpenAI image generation failed"}), 502
+    except Exception:
+        db.session.rollback()
+        if decremented_image:
+            refund_image(current_user.id)
+        logger.exception("Unexpected error during recipe image generation")
+        return jsonify({"error": "Image generation failed"}), 500
 
 
 @app.route("/api/check_auth", methods=["GET"])
