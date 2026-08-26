@@ -45,6 +45,7 @@ import jwt
 from jwt import PyJWKClient, InvalidTokenError
 import shutil
 import string
+import threading
 import time
 import traceback
 import uuid
@@ -2074,7 +2075,8 @@ CANONICAL_MATCH_THRESHOLD = 0.88  # tune empirically once there's real traffic
 
 def find_canonical_match(embedding):
     best, best_score = None, 0.0
-    for cand in CanonicalRecipe.query.all():
+    candidates = CanonicalRecipe.query.all()
+    for cand in candidates:
         if not cand.embedding:
             continue
         try:
@@ -2084,6 +2086,15 @@ def find_canonical_match(embedding):
         score = cosine_similarity(embedding, cand_vec)
         if score > best_score:
             best, best_score = cand, score
+
+    if best is None:
+        logger.info(f"Canonical match: no candidates with an embedding (canonical_recipe rows: {len(candidates)})")
+    else:
+        logger.info(
+            f"Canonical match: best={best.id} ({best.title!r}) score={best_score:.4f} "
+            f"threshold={CANONICAL_MATCH_THRESHOLD} candidates={len(candidates)}"
+        )
+
     return best if (best is not None and best_score >= CANONICAL_MATCH_THRESHOLD) else None
 
 
@@ -2128,11 +2139,65 @@ def save_recipe_image(img_bytes):
     return filename
 
 
+def _generate_image_background(recipe_id=None, canonical_id=None):
+    """
+    Runs on its own thread, decoupled from the request/response cycle
+    entirely — once /api/chat has returned, this keeps running against the
+    database regardless of whether the client is still connected. If both
+    recipe_id and canonical_id are given, one image is generated and written
+    to both rows (avoids paying for the same image twice). Needs its own app
+    context since it runs outside the request that spawned it — this is the
+    standard Flask-SQLAlchemy pattern for background work, giving this
+    thread its own scoped session rather than sharing the request's.
+
+    Caveat worth knowing: this is a daemon thread, not a durable job queue.
+    If this specific worker process gets recycled mid-generation (a deploy,
+    a restart, gunicorn rotating workers), the thread dies with it — no
+    error, just no image. That's what the nightly backfill job is for.
+    """
+    with app.app_context():
+        try:
+            recipe = Recipe.query.get(recipe_id) if recipe_id else None
+            canonical = CanonicalRecipe.query.get(canonical_id) if canonical_id else None
+            if recipe is None and canonical is None:
+                return
+
+            source = canonical or recipe
+            prompt = build_recipe_image_prompt(
+                source.title, source.description, source.course, source.main_ingredient
+            )
+            img_bytes = generate_recipe_image_bytes(prompt)
+            filename = save_recipe_image(img_bytes)
+
+            if recipe is not None:
+                recipe.image_file = filename
+            if canonical is not None:
+                canonical.image_file = filename
+                canonical.image_prompt = prompt
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logger.exception("Background image generation failed (non-fatal)")
+
+
+def _start_background_image_generation(recipe_id=None, canonical_id=None):
+    threading.Thread(
+        target=_generate_image_background,
+        kwargs={"recipe_id": recipe_id, "canonical_id": canonical_id},
+        daemon=True,
+    ).start()
+
+
 def _cache_canonical_recipe(message, parsed, content):
     """
     Best-effort: embed + insert a freshly generated recipe into the canonical
-    cache, including generating its image right away. Never raises — a cache
-    write failure shouldn't break the user's actual recipe response.
+    cache. Deliberately does NOT generate an image inline — that used to run
+    synchronously as part of this (and therefore of /api/chat's response
+    time), adding real seconds/cost to every cache-miss request. The caller
+    is expected to kick off _start_background_image_generation with the
+    returned row's id instead. Returns the new CanonicalRecipe on success,
+    None on failure — never raises; a cache write failure shouldn't break
+    the user's actual recipe response.
     """
     try:
         embedding = embed_text(message)
@@ -2153,19 +2218,12 @@ def _cache_canonical_recipe(message, parsed, content):
             hit_count=0,
         )
         db.session.add(canonical)
-        db.session.flush()
-
-        prompt = build_recipe_image_prompt(
-            canonical.title, canonical.description, canonical.course, canonical.main_ingredient
-        )
-        img_bytes = generate_recipe_image_bytes(prompt)
-        canonical.image_file = save_recipe_image(img_bytes)
-        canonical.image_prompt = prompt
-
         db.session.commit()
+        return canonical
     except Exception:
         db.session.rollback()
         logger.exception("Failed to cache canonical recipe (non-fatal)")
+        return None
 
 
 # generate recipe
@@ -2254,10 +2312,20 @@ def chat():
                 recipe.variations        = match.variations
                 recipe.difficulty        = match.difficulty
                 recipe.source_canonical_id = match.id
+                # Free — the canonical entry already has an image from a
+                # previous request. If it doesn't yet (still generating in
+                # the background, or that worker got recycled before it
+                # finished), kick off a background job below instead of
+                # leaving this recipe permanently imageless.
+                if match.image_file:
+                    recipe.image_file = match.image_file
 
                 match.hit_count = (match.hit_count or 0) + 1
                 db.session.commit()
                 logger.info(f"Recipe {recipe.id} served from canonical cache")
+
+                if not match.image_file:
+                    _start_background_image_generation(recipe_id=recipe.id, canonical_id=match.id)
 
                 return jsonify({
                     "recipe_id":    recipe.id,
@@ -2325,11 +2393,19 @@ def chat():
         db.session.commit()
         logger.info(f"Recipe {recipe.id} committed successfully")
 
-        # 5b) This was a generic request with no canonical match — cache the
-        # freshly generated recipe (+ its image) so the next similar request
-        # is a hit. Best-effort: never fails the user's actual response.
+        # 5b) Kick off this recipe's image in the background — the response
+        # below doesn't wait on it. If this was a generic request, also
+        # cache it into canonical_recipe (best-effort) so the next similar
+        # request is a hit, and generate one shared image for both rows
+        # instead of paying for it twice.
         if is_generic:
-            _cache_canonical_recipe(message, parsed, content)
+            canonical = _cache_canonical_recipe(message, parsed, content)
+            _start_background_image_generation(
+                recipe_id=recipe.id,
+                canonical_id=canonical.id if canonical else None,
+            )
+        else:
+            _start_background_image_generation(recipe_id=recipe.id)
 
         # 6) Return parsed recipe to frontend
         return jsonify(
