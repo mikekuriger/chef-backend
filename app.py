@@ -996,6 +996,10 @@ def admin_required(fn):
 
 
 # ROUTES
+# health check
+@app.route("/health")
+def health():
+    return {"status": "ok"}, 200
 
 # profile update page
 @app.route('/api/profile', methods=['GET', 'POST'])
