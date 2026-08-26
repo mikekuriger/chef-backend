@@ -8,3 +8,9 @@ dreamr.log
 Untitled*
 google_oauth_credentials.json
 j
+.dockerignore
+app.py.images
+env_chef
+google_play_service_account.json.delete
+node_modules/
+subscription_plans.sql
