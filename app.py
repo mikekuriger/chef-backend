@@ -78,6 +78,33 @@ if os.path.exists(cfg_path):
 # env overrides (Flask 3)
 app.config.from_prefixed_env(prefix="CHEF")
 
+# Text model for recipe generation. gpt-4o retires 2027-01-14. Set CHAT_MODEL in
+# config.py, or override with the CHEF_CHAT_MODEL env var (env wins).
+CHAT_MODEL = app.config.get("CHAT_MODEL") or "gpt-6-luna"
+# GPT-6 models reason by default. Only Luna and (GPT-6) Sol accept "none";
+# Astra and GPT-6.1 Sol reject it and need "low" or higher.
+_REASONING_NONE_MODELS = ("gpt-6-luna", "gpt-6-sol")
+
+
+def _default_reasoning_effort(model):
+    if not model.startswith("gpt-6"):
+        return ""  # older models reject the param entirely
+    return "none" if model.startswith(_REASONING_NONE_MODELS) else "low"
+
+
+CHAT_REASONING_EFFORT = app.config.get("CHAT_REASONING_EFFORT") or _default_reasoning_effort(CHAT_MODEL)
+if CHAT_REASONING_EFFORT == "none" and CHAT_MODEL.startswith("gpt-6") \
+        and not CHAT_MODEL.startswith(_REASONING_NONE_MODELS):
+    CHAT_REASONING_EFFORT = "low"  # guard: this model doesn't support "none"
+
+
+def chat_model_kwargs():
+    """model (+ reasoning_effort when applicable) kwargs for chat.completions."""
+    kw = {"model": CHAT_MODEL}
+    if CHAT_REASONING_EFFORT:
+        kw["reasoning_effort"] = CHAT_REASONING_EFFORT
+    return kw
+
 CORS(app, supports_credentials=True,origins=["https://chef.zentha.me", "https://chef-us-west-01.zentha.me", "http://localhost:5173"])
 
 db = SQLAlchemy(app)
@@ -1760,7 +1787,7 @@ def call_openai_with_retry(prompt, retries=3, delay=2):
     for attempt in range(retries):
         try:
             response = openai.chat.completions.create(
-                model="gpt-4o",
+                **chat_model_kwargs(),
                 messages=[{"role": "user", "content": prompt}]
             )
             return response
