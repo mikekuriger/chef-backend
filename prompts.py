@@ -18,7 +18,7 @@ Always follow these rules:
 
 Format your response as follows:
     **Title:**
-    **Difficulty:** (easy / medium / advanced)
+    **Difficulty:** (Easy / Medium / Advanced)
     **Description:** (short, appealing — do NOT mention a specific number of
         servings/people here or anywhere in Instructions/Variations; the app
         shows servings as its own editable field, and a number stated in
