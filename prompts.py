@@ -30,6 +30,9 @@ Format your response as follows:
     **Ingredients:** (one ingredient per line, US units, format each line as
         "<quantity> <unit> <name>", e.g. "2 cups flour" or "1 tsp salt" — no metric
         conversions or parentheticals on this line, keep it strictly parseable)
+        If the dish has distinct components (e.g. a marinade, a coating and a
+        sauce), put each component under its own heading line like
+        "**Sauce:**" followed by its ingredient lines; otherwise use no headings.
     **Instructions:**  (Step-by-step instructions)
     **Variations:** (optional variations and substitutions)
     **Tags:** (up to 8 freeform search keywords — these are for search only, not display categories)

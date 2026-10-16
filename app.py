@@ -1802,9 +1802,10 @@ _INGREDIENT_QTY_RE = re.compile(r"^\s*(?P<qty>\d+\s+\d+/\d+|\d+/\d+|\d+\.\d+|\d+
 def parse_ingredient_line(line):
     """
     Split one ingredient line ("2 cups flour", "1 tsp salt", "salt to taste")
-    into {"quantity", "unit", "name"}. Falls back to quantity/unit=None and
-    the full line as name whenever it can't confidently parse — never raises,
-    that row just isn't scalable and stays editable as plain text.
+    into {"quantity", "unit", "name", "section"}. Falls back to quantity/unit=None
+    and the full line as name whenever it can't confidently parse — never raises,
+    that row just isn't scalable and stays editable as plain text. `section` is
+    always None here; parse_ingredients_block fills it in from heading lines.
     """
     text = line.strip().lstrip("-*•").strip()
     text = re.sub(r"^\d+[.)]\s*", "", text)  # strip leading "1." / "1)" list markers
@@ -1828,18 +1829,63 @@ def parse_ingredient_line(line):
             else:
                 name = rest
 
-    return {"quantity": quantity, "unit": unit, "name": name}
+    return {"quantity": quantity, "unit": unit, "name": name, "section": None}
+
+
+_INGREDIENT_HEADING_RES = (
+    re.compile(r"^\*\*\s*(?P<h>[^*]+?)\s*:?\s*\*\*\s*:?$"),   # **Wet Batter:**
+    re.compile(r"^#{1,6}\s*(?P<h>.+?)\s*:?$"),                  # ### Wet Batter
+    re.compile(r"^(?P<h>[A-Za-z][^:]{0,58}):$"),                # Wet Batter:  / For the sauce:
+)
+
+
+def parse_ingredient_heading(line):
+    """Return the section title if `line` is a heading rather than an ingredient."""
+    text = line.strip()
+    if not text or text[0] in "-*•" and not text.startswith("**"):
+        return None
+    for pattern in _INGREDIENT_HEADING_RES:
+        m = pattern.match(text)
+        if m:
+            return m.group("h").strip() or None
+    return None
 
 
 def parse_ingredients_block(block):
     if not block:
         return []
     items = []
+    section = None
     for line in block.splitlines():
+        heading = parse_ingredient_heading(line)
+        if heading:
+            section = heading
+            continue
         parsed = parse_ingredient_line(line)
         if parsed:
+            parsed["section"] = section
             items.append(parsed)
     return items
+
+
+def ingredients_to_text(items):
+    """
+    Render structured ingredients back to the legacy free-text block
+    (recipe.ingredients): "- 2 cups flour" lines, with a "**Section:**"
+    heading line wherever the section changes.
+    """
+    lines = []
+    current = None
+    for item in items:
+        section = (item.get("section") or "").strip() or None
+        if section != current:
+            current = section
+            if section:
+                lines.append(f"**{section}:**")
+        lines.append("- " + " ".join(
+            p for p in [item.get("quantity"), item.get("unit"), item.get("name")] if p
+        ))
+    return "\n".join(lines)
 
 
 def parse_recipe_ai_response(content: str) -> dict:
@@ -2304,9 +2350,8 @@ def chat():
                 recipe.time              = match.time
                 recipe.servings          = match.servings
                 recipe.ingredients_json  = match.ingredients_json
-                recipe.ingredients       = "\n".join(
-                    f"- {' '.join(p for p in [i.get('quantity'), i.get('unit'), i.get('name')] if p)}"
-                    for i in json.loads(match.ingredients_json or "[]")
+                recipe.ingredients       = ingredients_to_text(
+                    json.loads(match.ingredients_json or "[]")
                 ) or None
                 recipe.instructions      = match.instructions
                 recipe.variations        = match.variations
@@ -2612,7 +2657,6 @@ def update_recipe(recipe_id):
         if not isinstance(raw_items, list):
             return jsonify({"error": "ingredients must be a list"}), 400
         clean_items = []
-        text_lines = []
         for item in raw_items:
             if not isinstance(item, dict):
                 return jsonify({"error": "each ingredient must be an object"}), 400
@@ -2621,12 +2665,12 @@ def update_recipe(recipe_id):
                 continue
             quantity = (item.get("quantity") or "").strip() or None
             unit = (item.get("unit") or "").strip() or None
-            clean_items.append({"quantity": quantity, "unit": unit, "name": name})
-            text_lines.append(" ".join(p for p in [quantity, unit, name] if p))
+            section = (item.get("section") or "").strip()[:100] or None
+            clean_items.append({"quantity": quantity, "unit": unit, "name": name, "section": section})
         recipe.ingredients_json = json.dumps(clean_items)
         # Regenerate the legacy free-text column too, so anything still
         # reading recipe.ingredients (sharing, PDF export, etc.) stays correct.
-        recipe.ingredients = "\n".join(f"- {line}" for line in text_lines) or None
+        recipe.ingredients = ingredients_to_text(clean_items) or None
 
     # Keep the legacy free-text categories column roughly in sync for any
     # display path that hasn't been migrated to course/main_ingredient yet.
